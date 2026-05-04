@@ -160,7 +160,7 @@ where
       if config.pattern.has_content_hash() {
         content_hashes = Some(vec![hash(
           &code,
-          matches!(config.pattern.segments[0], crate::css_modules::Segment::ContentHash),
+          matches!(config.pattern.segments[0], crate::css_modules::Segment::ContentHash { ... }),
         )]);
       }
     }

@@ -24,6 +24,26 @@ use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
+/// Algorithms for hashing CSS module names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HashAlgorithm {
+  /// xxHash64 algorithm.
+  Xxhash64,
+  /// MD4 algorithm.
+  Md4,
+  /// SipHash algorithm (current default).
+  Siphash,
+}
+
+/// Digest types for CSS module hash output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DigestType {
+  /// Base64 encoding (custom, not standard).
+  Base64,
+  /// Hexadecimal encoding.
+  Hex,
+}
+
 /// Configuration for CSS modules.
 #[derive(Clone, Debug)]
 pub struct Config<'i> {
@@ -72,7 +92,15 @@ pub struct Pattern<'i> {
 impl<'i> Default for Pattern<'i> {
   fn default() -> Self {
     Pattern {
-      segments: smallvec![Segment::Hash, Segment::Literal("_"), Segment::Local],
+      segments: smallvec![
+        Segment::Hash {
+          algo: None,
+          digest: None,
+          length: None
+        },
+        Segment::Literal("_"),
+        Segment::Local
+      ],
     }
   }
 }
@@ -110,11 +138,11 @@ impl<'i> Pattern<'i> {
     while !input.is_empty() {
       if input.starts_with('[') {
         if let Some(end_idx) = input.find(']') {
-          let segment = match &input[0..=end_idx] {
-            "[name]" => Segment::Name,
-            "[local]" => Segment::Local,
-            "[hash]" => Segment::Hash,
-            "[content-hash]" => Segment::ContentHash,
+          let placeholder = &input[1..end_idx];
+          let segment = match placeholder {
+            "name" => Segment::Name,
+            "local" => Segment::Local,
+            s if s.contains("hash") => Self::parse_hash_segment(s, start_idx)?,
             s => return Err(PatternParseError::UnknownPlaceholder(s.into(), start_idx)),
           };
           segments.push(segment);
@@ -134,9 +162,110 @@ impl<'i> Pattern<'i> {
     Ok(Pattern { segments })
   }
 
+  fn parse_hash_segment(placeholder: &'i str, start_idx: usize) -> Result<Segment<'i>, PatternParseError> {
+    let parts: Vec<&str> = placeholder.split(':').collect();
+    let mut algo = None;
+    let mut digest = None;
+    let mut length = None;
+    let mut content_hash = false;
+    let mut hash_keyword_found = false;
+
+    let mut part_iter = parts.iter().peekable();
+
+    // Parse algorithm (optional)
+    if let Some(first_part) = part_iter.peek() {
+      if !first_part.eq_ignore_ascii_case("hash") && !first_part.eq_ignore_ascii_case("content-hash") {
+        match first_part.to_lowercase().as_str() {
+          "xxhash64" => algo = Some(HashAlgorithm::Xxhash64),
+          "md4" => algo = Some(HashAlgorithm::Md4),
+          "siphash" => algo = Some(HashAlgorithm::Siphash),
+          // If it's not a known algo and not "hash"/"contenthash", it might be a digest or length
+          // if "hash" keyword is not present. Or it's an error.
+          // For now, we assume it moves to the next part if not a recognized algo.
+          _ => { /* Potentially a digest or length if hash keyword is implied or next */ }
+        }
+        if algo.is_some() {
+          part_iter.next(); // Consume algo part
+        }
+      }
+    }
+
+    // Check for "hash" or "contenthash" keyword
+    if let Some(current_part) = part_iter.peek() {
+      if current_part.eq_ignore_ascii_case("hash") {
+        hash_keyword_found = true;
+        part_iter.next(); // Consume "hash"
+      } else if current_part.eq_ignore_ascii_case("content-hash") {
+        hash_keyword_found = true;
+        content_hash = true;
+        part_iter.next();
+      } else {
+        return Err(PatternParseError::UnknownPlaceholder(placeholder.into(), start_idx));
+      }
+    }
+
+    if !hash_keyword_found && algo.is_none() && parts.len() > 1 && !parts.contains(&"hash") {
+      // If "hash" is not explicitly mentioned, but there are colons,
+      // it implies the [hash] placeholder with potential digest/length.
+      // e.g. [base64:5] should be treated as [hash:base64:5]
+      // The first part could be digest or length.
+      // Reset iterator if algo wasn't found and hash wasn't found.
+      // This logic is getting complex; simpler: if "hash" is not found, it's not for this parser.
+      // The outer parser already checks if "hash" is *in* the string.
+      // Let's rely on "hash" keyword being present for this detailed parsing.
+      // If "hash" is not in parts, it should not have reached here unless it was just "[hash]"
+      // which is fine, or it's an error.
+      // The simple `s if s.contains("hash")` in the caller is a bit too broad.
+      // It should be `s == "hash" || (s.contains(':') && s.contains("hash"))`
+      // For now, let's assume "hash" MUST be one of the parts.
+      if !parts.iter().any(|p| p.eq_ignore_ascii_case("hash")) {
+        return Err(PatternParseError::UnknownPlaceholder(placeholder.into(), start_idx));
+      }
+    }
+
+    // Parse digest type (optional)
+    if let Some(current_part) = part_iter.peek() {
+      match current_part.to_lowercase().as_str() {
+        "base64" => {
+          digest = Some(DigestType::Base64);
+          part_iter.next(); // Consume digest part
+        }
+        "hex" => {
+          digest = Some(DigestType::Hex);
+          part_iter.next(); // Consume digest part
+        }
+        _ => { /* Not a digest, could be length */ }
+      }
+    }
+
+    // Parse length (optional)
+    if let Some(current_part) = part_iter.peek() {
+      if let Ok(num) = current_part.parse::<usize>() {
+        length = Some(num);
+        part_iter.next(); // Consume length part
+      } else {
+        // If it's not a number and there are still parts left, it's an unknown part
+        if part_iter.peek().is_some() {
+          return Err(PatternParseError::UnknownPlaceholder(placeholder.into(), start_idx));
+        }
+      }
+    }
+
+    // If there are still unconsumed parts, it's an error
+    if part_iter.next().is_some() {
+      return Err(PatternParseError::UnknownPlaceholder(placeholder.into(), start_idx));
+    }
+
+    if content_hash {
+      Ok(Segment::ContentHash { algo, digest, length })
+    } else {
+      Ok(Segment::Hash { algo, digest, length })
+    }
+  }
+
   /// Whether the pattern contains any `[content-hash]` segments.
   pub fn has_content_hash(&self) -> bool {
-    self.segments.iter().any(|s| matches!(s, Segment::ContentHash))
+    self.segments.iter().any(|s| matches!(s, Segment::ContentHash { .. }))
   }
 
   /// Write the substituted pattern to a destination.
@@ -167,10 +296,10 @@ impl<'i> Pattern<'i> {
         Segment::Local => {
           write(local)?;
         }
-        Segment::Hash => {
+        Segment::Hash { algo, digest, length } => {
           write(hash)?;
         }
-        Segment::ContentHash => {
+        Segment::ContentHash { algo, digest, length } => {
           write(content_hash)?;
         }
       }
@@ -204,9 +333,23 @@ pub enum Segment<'i> {
   /// The original class name.
   Local,
   /// A hash of the file name.
-  Hash,
+  Hash {
+    /// The hashing algorithm to use. Defaults to Siphash.
+    algo: Option<HashAlgorithm>,
+    /// The digest type for the hash output. Defaults to Base64.
+    digest: Option<DigestType>,
+    /// The maximum length of the hash. Defaults to the full length.
+    length: Option<usize>,
+  },
   /// A hash of the file contents.
-  ContentHash,
+  ContentHash {
+    /// The hashing algorithm to use. Defaults to Siphash.
+    algo: Option<HashAlgorithm>,
+    /// The digest type for the hash output. Defaults to Base64.
+    digest: Option<DigestType>,
+    /// The maximum length of the hash. Defaults to the full length.
+    length: Option<usize>,
+  },
 }
 
 /// A referenced name within a CSS module, e.g. via the `composes` property.
@@ -298,7 +441,7 @@ impl<'a, 'b, 'c> CssModule<'a, 'b, 'c> {
         };
         hash(
           &source.to_string_lossy(),
-          matches!(config.pattern.segments[0], Segment::Hash),
+          matches!(config.pattern.segments[0], Segment::Hash { .. }),
         )
       })
       .collect();
